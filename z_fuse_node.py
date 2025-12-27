@@ -644,8 +644,8 @@ class ZFuseBake:
             total_skipped = 0
             debug_counter = 0
             
-            # Helper to save memory
-            offload_device = torch.device("cpu")
+            # Keep calculations in VRAM for speed
+            cuda_device = comfy.model_management.get_torch_device()
             
             for key, patch_list in patches.items():
                 total_delta = None
@@ -659,27 +659,23 @@ class ZFuseBake:
 
                 for p in patch_list:
                     try:
-                        # 1. ROBUST EXTRACTION
-                        # Recursively find the Tensor and the Strength from potentially nested structures
+                        # 1. ROBUST EXTRACTION (In VRAM)
                         t = self._find_tensor(p)
                         strength = self._find_strength(p)
                         
                         if t is None:
                             continue
 
-                        # 2. FORCE COPY TO CPU (Nuclear Proof)
-                        # We use torch.tensor() to force a copy. This handles wrapped tensors, parameters, etc.
-                        # We explicitly move to CPU to ensure it's off VRAM before manipulation.
-                        t_cpu = torch.tensor(t, device=offload_device)
-                        
-                        # 3. Apply Strength
-                        # Move to float16 for storage consistency
-                        d_final = t_cpu.to(torch.float16) * strength
+                        # 2. DIRECT MANIPULATION (In VRAM)
+                        # Move to Target Precision in VRAM (Fast)
+                        # We don't force a copy unless necessary.
+                        d = t.to(out_dtype)
+                        d = d * strength
                         
                         if total_delta is None:
-                            total_delta = d_final
+                            total_delta = d
                         else:
-                            total_delta += d_final
+                            total_delta += d
                             
                     except Exception as e:
                         # Log individual patch failures but don't crash the whole bake
@@ -696,9 +692,11 @@ class ZFuseBake:
                     
                     if user_rank >= in_features:
                         # NO-LOSS
-                        up_weight = total_delta.to(out_dtype)
-                        # Identity matrix must match the inner dimension of multiplication
-                        down_weight = torch.eye(in_features, dtype=out_dtype)
+                        # up is the actual delta. 
+                        # down is Identity matrix. 
+                        # We construct the Identity matrix on the target device (usually CUDA).
+                        up_weight = total_delta
+                        down_weight = torch.eye(in_features, dtype=out_dtype, device=total_delta.device)
                         alpha = torch.tensor(in_features, dtype=torch.float16)
                         
                         logs.append(f"[{key}] Saved Full-Rank (No-Loss). Shape: {total_delta.shape}")
@@ -710,6 +708,8 @@ class ZFuseBake:
                             U = U[:, :user_rank]
                             S = S[:user_rank]
                             Vh = Vh[:user_rank, :]
+                            
+                            # Combine S into U for standard LoRA Up weight
                             up_weight = (U @ torch.diag(S)).to(out_dtype)
                             down_weight = Vh.to(out_dtype)
                             alpha = torch.tensor(user_rank, dtype=torch.float16)
@@ -739,7 +739,10 @@ class ZFuseBake:
             if count == 0:
                 return ("\n".join(logs) + "\n\nFAILED: No valid 2D weight patches found to bake. Check DEBUG info above.",)
             
-            # Determine directory
+            # VRAM Cleanup before Save
+            torch.cuda.empty_cache()
+            gc.collect()
+            
             save_dir = custom_path.strip() if custom_path.strip() else os.path.join(folder_paths.get_output_directory(), "loras")
             os.makedirs(save_dir, exist_ok=True)
             
@@ -755,6 +758,7 @@ class ZFuseBake:
                 "precision": precision
             }
             
+            # save_file handles the final CPU write efficiently
             save_file(baked_sd, full_path, metadata=metadata)
             
             logs.append(f"\n--- SUCCESS ---")
