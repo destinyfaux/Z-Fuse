@@ -39,7 +39,7 @@ Precision Control: Export in FP16, BF16, or FP32.
 Installation
 Navigate to your ComfyUI custom_nodes directory.
 Clone this repository:
-git clone https://github.com/YOUR_USERNAME/Z-FUSE.git
+git clone https://github.com/destinyfaux/Z-Fuse.git
 Restart ComfyUI.
 Quick Start
 Load Model: Use the standard CheckpointLoaderSimple.
