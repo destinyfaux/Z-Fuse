@@ -274,6 +274,42 @@ class ZFuseOrchestrator:
     FUNCTION = "orchestrate"
     CATEGORY = "Z-Image/Fusion"
 
+    def _normalize_tensor_shapes(self, deltas, status_log):
+        """
+        Pads all tensors in the list to match the largest dimensions.
+        This resolves Rank mismatches (e.g., Rank 32 vs Rank 128) or 
+        Geometry mismatches by zero-padding the smaller tensors.
+        """
+        if not deltas:
+            return []
+            
+        # Find the maximum shape across all contributors for this key
+        max_h = max(d.shape[0] for d in deltas)
+        max_w = max(d.shape[1] for d in deltas)
+        target_shape = (max_h, max_w)
+        
+        normalized_deltas = []
+        
+        for d in deltas:
+            if d.shape == target_shape:
+                normalized_deltas.append(d)
+            else:
+                # Padding logic: Pad height (dim 0) and width (dim 1)
+                # F.pad arguments: (left, right, top, bottom)
+                pad_h = target_shape[0] - d.shape[0]
+                pad_w = target_shape[1] - d.shape[1]
+                
+                # Only pad if needed
+                if pad_h > 0 or pad_w > 0:
+                    # We preserve dtype (usually float16)
+                    padded = torch.nn.functional.pad(d, (0, pad_w, 0, pad_h))
+                    status_log.append(f"  [SHAPE FIX] Padded tensor {d.shape} -> {target_shape}")
+                    normalized_deltas.append(padded)
+                else:
+                    normalized_deltas.append(d)
+                    
+        return normalized_deltas
+
     def orchestrate(self, model, lora_stack, merge_mode, ties_threshold):
         # Create a unique key based on the current inputs
         # This ensures if you change a slider, the cache invalidates
@@ -467,6 +503,10 @@ class ZFuseOrchestrator:
         fused_patches = {}
         
         for key, deltas in aggregated_deltas.items():
+            # --- SHAPE NORMALIZATION FIX ---
+            # Ensure all tensors for this key have identical dimensions before stacking
+            deltas = self._normalize_tensor_shapes(deltas, status_log)
+            
             num_contributors = len(deltas)
             stacked = torch.stack(deltas).to(torch.float32)
             
@@ -499,7 +539,9 @@ class ZFuseOrchestrator:
                 consensus_count = aligned_mask.sum(dim=0).clamp(min=1.0)
                 fused = (trimmed * aligned_mask).sum(dim=0) / consensus_count
 
-            # SAFETY CLAMP: Final boundary to prevent S3-DiT structural collapse
+            # SAFETY CLAMP: Element-wise clamp to prevent "Frying" (NaNs/Inf)
+            # Clamping individual values to +/- 4.0 allows up to 40x standard strength 
+            # while preventing numerical instability.
             fused = torch.clamp(fused, -4.0, 4.0).to(torch.float16)
             fused_patches[key] = (fused.to(offload_device),)
 
